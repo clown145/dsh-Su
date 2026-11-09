@@ -64,6 +64,8 @@ NPM_REGISTRY="https://registry.npmmirror.com"
 TERMUX_REPO="https://packages.termux.dev/apt/termux-main"
 UBUNTU_ARCHIVE_AMD64="https://mirrors.tuna.tsinghua.edu.cn/ubuntu"        # InRelease verified with gpgv
 UBUNTU_ARCHIVE_ARM64="https://mirrors.tuna.tsinghua.edu.cn/ubuntu-ports"
+# Retained copies of the locked debs when live mirrors retire an older package.
+UBUNTU_SNAPSHOT="https://snapshot.ubuntu.com/ubuntu/20261101T000000Z"
 PBS_OFFICIAL="https://github.com/astral-sh/python-build-standalone/releases/download"
 PBS_MIRROR="https://registry.npmmirror.com/-/binary/python-build-standalone"
 
@@ -94,14 +96,25 @@ for tool in curl sha256sum python3 tar xz; do
   command -v "$tool" >/dev/null || die "missing host tool: $tool"
 done
 
-# fetch URL DEST [expected-sha256]: cached download with checksum verification.
+# fetch URL DEST [expected-sha256] [fallback-on-404]: cached, checksum-verified download.
 fetch() {
-  local url="$1" dest="$2" want="${3:-}"
+  local url="$1" dest="$2" want="${3:-}" fallback="${4:-}"
   mkdir -p "$(dirname "$dest")"
   if [[ -f "$dest" && -n "$want" && "$(sha256 "$dest")" == "$want" ]]; then return 0; fi
   if [[ -f "$dest" && -z "$want" ]]; then return 0; fi
   log "download $url"
-  curl -fL --retry 3 --retry-delay 2 --connect-timeout 20 -sS -o "$dest.part" "$url"
+  local status code
+  if status="$(curl -fL --retry 3 --retry-delay 2 --connect-timeout 20 -sS -w '%{http_code}' -o "$dest.part" "$url")"; then
+    :
+  else
+    code=$?
+    rm -f "$dest.part"
+    if [[ "$status" != 404 || -z "$fallback" || -z "$want" ]]; then return "$code"; fi
+    log "package retired from live mirror; download $fallback"
+    curl -fL --retry 3 --retry-delay 2 --connect-timeout 20 -sS -o "$dest.part" "$fallback" || {
+      code=$?; rm -f "$dest.part"; return "$code"
+    }
+  fi
   mv "$dest.part" "$dest"
   if [[ -n "$want" ]]; then
     local got; got="$(sha256 "$dest")"
@@ -196,7 +209,7 @@ PYEOF
   local name file sum
   while read -r file sum; do
     name="$(basename "$file")"
-    fetch "$mirror/$file" "$CACHE/ubuntu/debs/$name" "$sum"
+    fetch "$mirror/$file" "$CACHE/ubuntu/debs/$name" "$sum" "$UBUNTU_SNAPSHOT/$file"
     printf '%s\n' "$CACHE/ubuntu/debs/$name"
   done < <(python3 -I -c 'import json,sys; [print(p["filename"], p["sha256"]) for p in json.load(open(sys.argv[1]))["packages"]]' "$lock")
 }

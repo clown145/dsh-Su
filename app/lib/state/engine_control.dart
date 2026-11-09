@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../runtime/runtime_bridge.dart';
@@ -34,6 +35,14 @@ abstract final class EngineControl {
     );
   }
 
+  /// Changes the local index mode only after stopping, then starts the same profile.
+  /// A rejected stop or write cannot start a new run.
+  static Future<void> setWorkspaceRecovery(ProviderContainer container, {required bool enabled}) async {
+    await _stopForRecovery(container);
+    await container.read(runtimeBridgeProvider).setWorkspaceRecovery(enabled);
+    await _restartForRecovery(container, afterRecovery: true);
+  }
+
   /// Starts the engine unless it is already starting or running.
   static Future<void> ensureStarted(ProviderContainer container) async {
     final phase = container.read(localRuntimeProvider).status.phase;
@@ -49,12 +58,15 @@ abstract final class EngineControl {
   static bool shouldAutoStart(RuntimeStatus status) =>
       !(status.safeState == SafeModeState.off && !status.autoSafe && status.strikes >= 2);
 
-  /// Restarts in safe mode, first renaming the given home-level files out of the way.
+  /// Stops before renaming home-level files, then starts the safe profile.
   static Future<void> enterSafeMode(ProviderContainer container, {List<String> moveAside = const []}) async {
-    if (moveAside.isNotEmpty) {
-      await container.read(runtimeBridgeProvider).moveAside(moveAside);
+    if (moveAside.isEmpty) {
+      await _restartForRecovery(container, mode: EngineMode.safe);
+      return;
     }
-    await restart(container, mode: EngineMode.safe);
+    await _stopForRecovery(container);
+    await container.read(runtimeBridgeProvider).moveAside(moveAside);
+    await _restartForRecovery(container, mode: EngineMode.safe, afterRecovery: true);
   }
 
   /// Back to the user's own profile; failing again within two minutes returns to safe mode.
@@ -68,17 +80,44 @@ abstract final class EngineControl {
         status.phase == RuntimePhase.running ||
         status.phase == RuntimePhase.starting ||
         status.phase == RuntimePhase.stopping;
-    // A normal-mode DSH must not be running on the profile being rewritten; a safe one may.
-    if (busy && !status.inSafeMode) await _stopAndWait(container);
+    // Only a currently running safe profile may keep running during this write.
+    final safeRunning = status.inSafeMode && status.phase == RuntimePhase.running;
+    if (busy && !safeRunning) await _stopForRecovery(container);
     final changed = await container.read(runtimeBridgeProvider).restoreLastKnownGood();
-    await restart(container, mode: EngineMode.normal);
+    await _restartForRecovery(container, mode: EngineMode.normal, afterRecovery: true);
     return changed;
+  }
+
+  static Future<void> _stopForRecovery(ProviderContainer container) async {
+    try {
+      await _stopAndWait(container);
+    } on TimeoutException {
+      throw PlatformException(code: 'runtime_not_stopped');
+    }
+  }
+
+  static Future<void> _restartForRecovery(
+    ProviderContainer container, {
+    EngineMode? mode,
+    bool afterRecovery = false,
+  }) async {
+    try {
+      await restart(container, mode: mode);
+    } on TimeoutException {
+      throw PlatformException(code: afterRecovery ? 'runtime_not_stopped_after_recovery' : 'runtime_not_stopped');
+    }
   }
 
   static Future<void> _stopAndWait(
     ProviderContainer container, {
     Duration timeout = const Duration(seconds: 20),
   }) async {
+    bool stoppedNow() {
+      final phase = container.read(localRuntimeProvider).status.phase;
+      return !phase.isBusy && phase != RuntimePhase.running;
+    }
+
+    if (stoppedNow()) return;
     final stopped = Completer<void>();
     final sub = container.listen<RuntimePhase>(localRuntimeProvider.select((s) => s.status.phase), (_, next) {
       if (!next.isBusy && next != RuntimePhase.running && !stopped.isCompleted) {
@@ -89,6 +128,8 @@ abstract final class EngineControl {
       final stop = container.read(localRuntimeProvider).status.phase == RuntimePhase.stopping
           ? Future<void>.value()
           : container.read(localRuntimeProvider.notifier).stop();
+      if (stoppedNow() && !stopped.isCompleted) stopped.complete();
+      // A stopped status alone is insufficient: Root cleanup must acknowledge too.
       await Future.wait<void>([stop, stopped.future], eagerError: true).timeout(timeout);
     } finally {
       sub.close();

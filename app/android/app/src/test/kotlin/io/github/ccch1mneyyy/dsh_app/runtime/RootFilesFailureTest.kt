@@ -50,21 +50,13 @@ class RootFilesFailureTest {
             val file = SafeMode.guestFile(root, SafeMode.MOVABLE[0])
             file.parentFile.mkdirs()
             file.writeText("# keep me\n")
-            // The parent directory is not writable, so renameTo fails on a real
-            // filesystem that enforces it; the method must throw instead of returning
-            // an empty "moved" list that would hide the hazard.
-            file.parentFile.setWritable(false, false)
-            try {
-                try {
-                    SafeMode.moveAside(root, listOf(SafeMode.MOVABLE[0]), "20260101-000000")
-                    // Some filesystems (and root-running tests) still allow the rename;
-                    // nothing to assert there, the happy path is covered elsewhere.
-                } catch (e: java.io.IOException) {
-                    assertTrue(e.message!!.contains(SafeMode.MOVABLE[0]))
-                }
-            } finally {
-                file.parentFile.setWritable(true, true)
-            }
+            // An overlong target name fails even when the test process has Root
+            // privileges; chmod would not reliably exercise the failure path.
+            val result = SafeMode.moveAside(root, listOf(SafeMode.MOVABLE[0]), "x".repeat(300))
+            assertTrue(result.moved.isEmpty())
+            assertNotNull(result.failure)
+            assertTrue(result.failure!!.message!!.contains(SafeMode.MOVABLE[0]))
+            assertEquals("# keep me\n", file.readText())
         } finally { root.deleteRecursively() }
     }
 
@@ -75,7 +67,8 @@ class RootFilesFailureTest {
             file.parentFile.mkdirs()
             file.writeText("HTTP_PROXY=http://proxy:1\n")
             val moved = SafeMode.moveAside(root, listOf(SafeMode.MOVABLE[2]), "20260101-000000")
-            assertEquals(listOf(SafeMode.MOVABLE[2] to "/root/.env.off-20260101-000000"), moved)
+            assertEquals(listOf(SafeMode.MOVABLE[2] to "/root/.env.off-20260101-000000"), moved.moved)
+            assertNull(moved.failure)
             assertFalse(file.exists())
         } finally { root.deleteRecursively() }
     }

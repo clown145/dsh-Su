@@ -23,6 +23,8 @@ val hasWholeReleaseKey = listOf("storeFile", "keyAlias").all { !keyProps.getProp
 val runtimeOut = rootProject.file("../../runtime/out")
 
 val rootRuntime = (project.findProperty("dsh.rootRuntime") as? String) == "true"
+// Explicit inspection builds can opt out of release signing.
+val unsignedRelease = (project.findProperty("dsh.unsignedRelease") as? String) == "true"
 
 // versionCode is the build minute, same encoding as tooling/build_number.py:
 // (year - 2026) * 10^8 + MMDDhhmm at UTC+8. tooling/build-apk.sh passes it as
@@ -131,8 +133,9 @@ android {
             if (hasWholeReleaseKey) signingConfig = signingConfigs.getByName("release")
         }
         release {
-            // Use the release key when configured; local builds without key.properties fall back to debug.
-            signingConfig = signingConfigs.getByName(if (keyProps.isEmpty) "debug" else "release")
+            // Preserve normal builds; opt-in inspection APKs have no signature at all.
+            signingConfig = if (unsignedRelease) null else
+                signingConfigs.getByName(if (keyProps.isEmpty) "debug" else "release")
             // Ours on top of Flutter's: phone control's privileged process and
             // its TLS libraries are reached by class name (see the file).
             proguardFiles("proguard-rules.pro")
@@ -151,10 +154,14 @@ flutter {
 }
 
 dependencies {
+    // Bundled Chinese OCR. SDK statistics disclosed separately; initialization is opt-in per use.
+    implementation("com.google.mlkit:text-recognition-chinese:16.0.1")
     testImplementation("junit:junit:4.13.2")
     implementation("com.github.topjohnwu.libsu:core:6.0.0") // Apache-2.0: root shell + RootService Binder IPC
     implementation("com.github.topjohnwu.libsu:io:6.0.0")
     implementation("com.github.topjohnwu.libsu:service:6.0.0")
+    // Android stubs do not implement JSONObject in local JVM upgrade tests.
+    testImplementation("org.json:json:20240303")
 
     // .tar.xz support for the rootfs bundle.
     implementation("org.tukaani:xz:1.10")

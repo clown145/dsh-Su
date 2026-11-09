@@ -1,15 +1,11 @@
-# 上游同步——复用一个未合入的 sync PR；合入后删除其分支。不自动 merge、release 或部署。
-# 每周一跑一次，也可手动 dispatch。合并冲突时不 push，把上游提交列表写进
+# 手动上游同步——复用一个未合入的 sync PR。不自动 merge、release、部署或删除分支。
+# 只在维护者手动 dispatch 时运行。合并冲突时不 push，把上游提交列表写进
 # step summary 并失败退出，交给人工在本地解决后手动开 PR。
 # 只用默认 GITHUB_TOKEN，不读取任何存储凭据。
 name: Upstream Sync
 
 on:
-  schedule:
-    - cron: "17 3 * * 1"
   workflow_dispatch:
-  pull_request:
-    types: [closed]
 
 permissions:
   contents: write
@@ -21,7 +17,6 @@ concurrency:
 
 jobs:
   sync:
-    if: github.repository == 'Rakanrkk/dsh-Su' && github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
@@ -142,28 +137,4 @@ jobs:
               --head "$BRANCH" \
               --title "同步上游 ccch1mneyyy/dsh-Go@$SHORT" \
               --body-file body.md
-          fi
-
-  cleanup-merged-sync-branch:
-    if: >-
-      github.repository == 'Rakanrkk/dsh-Su' &&
-      github.event_name == 'pull_request' &&
-      github.event.action == 'closed' &&
-      github.event.pull_request.merged == true &&
-      github.event.pull_request.base.ref == 'main' &&
-      startsWith(github.event.pull_request.head.ref, 'chore/upstream-sync-') &&
-      github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: main
-          fetch-depth: 0
-
-      - name: Delete the merged sync branch
-        env:
-          BRANCH: ${{ github.event.pull_request.head.ref }}
-        run: |
-          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null; then
-            git push origin --delete "$BRANCH"
           fi

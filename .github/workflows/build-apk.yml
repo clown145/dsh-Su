@@ -1,0 +1,242 @@
+name: Build SU APK
+
+on:
+  push:
+    branches: [main, 'integrate/**']
+  workflow_dispatch:
+    inputs:
+      signing:
+        description: 'Fixed personal signature, or unsigned APK for inspection'
+        type: choice
+        options: [personal-signed, unsigned]
+        default: personal-signed
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-su-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  arm64:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      FLUTTER_VERSION: 3.47.7
+      NODE_VERSION: 24.22.1
+      DSH_MAVEN_MIRRORS: 0
+      DSH_UPDATE_REPO: ${{ github.repository }}
+      DSH_BETA_TOKEN_FILE: ''
+      TZ: Asia/Shanghai
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Choose signing mode
+        id: signing
+        env:
+          REQUESTED_SIGNING: ${{ inputs.signing || 'personal-signed' }}
+        run: |
+          case "$REQUESTED_SIGNING" in
+            unsigned)
+              echo 'mode=unsigned' >> "$GITHUB_OUTPUT"
+              echo 'label=UNSIGNED' >> "$GITHUB_OUTPUT"
+              echo 'DSH_UNSIGNED_RELEASE=1' >> "$GITHUB_ENV"
+              echo 'Unsigned inspection build: the APK cannot be installed until it is signed.'
+              ;;
+            personal-signed)
+              echo 'mode=personal-signed' >> "$GITHUB_OUTPUT"
+              echo 'label=PERSONAL-SIGNED' >> "$GITHUB_OUTPUT"
+              echo 'DSH_UNSIGNED_RELEASE=0' >> "$GITHUB_ENV"
+              ;;
+            *) echo 'Unknown signing mode' >&2; exit 1 ;;
+          esac
+
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Prepare the fixed personal signing key
+        if: steps.signing.outputs.mode == 'personal-signed'
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          python3 - <<'PY'
+          import base64
+          import os
+          from pathlib import Path
+
+          names = ('ANDROID_KEYSTORE_BASE64', 'ANDROID_KEYSTORE_PASSWORD',
+                   'ANDROID_KEY_ALIAS', 'ANDROID_KEY_PASSWORD')
+          provided = [bool(os.environ.get(name)) for name in names]
+          if not all(provided):
+              raise SystemExit('Personal-signed builds require all four ANDROID_* signing secrets. Configure the fixed fork key in repository Actions secrets; no debug or temporary key will be used.')
+          folder = Path(os.environ['RUNNER_TEMP']) / 'dsh-su-signing'
+          folder.mkdir(mode=0o700, exist_ok=True)
+          key = folder / 'release.jks'
+          try:
+              key.write_bytes(base64.b64decode(''.join(os.environ[names[0]].split()), validate=True))
+          except ValueError:
+              raise SystemExit('ANDROID_KEYSTORE_BASE64 is not valid base64') from None
+          key.chmod(0o600)
+
+          def property_value(value):
+              # java.util.Properties.load(InputStream) reads ISO-8859-1.
+              encoded = value.encode('utf-16-be')
+              return ''.join('\\u' + encoded[i:i + 2].hex() for i in range(0, len(encoded), 2))
+
+          values = {'storeFile': str(key), 'storePassword': os.environ[names[1]],
+                    'keyAlias': os.environ[names[2]], 'keyPassword': os.environ[names[3]]}
+          properties = Path('app/android/key.properties')
+          properties.write_text(''.join(k + '=' + property_value(v) + '\n' for k, v in values.items()), encoding='ascii')
+          properties.chmod(0o600)
+          PY
+          keytool -exportcert -keystore "$RUNNER_TEMP/dsh-su-signing/release.jks" \
+            -alias "$ANDROID_KEY_ALIAS" -storepass:env ANDROID_KEYSTORE_PASSWORD \
+            -file "$RUNNER_TEMP/dsh-su-signing/certificate.der"
+          actual=$(sha256sum "$RUNNER_TEMP/dsh-su-signing/certificate.der" | cut -d' ' -f1)
+          echo "EXPECTED_SIGNER_SHA256=$actual" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+      - uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: runtime/.cache
+          key: su-runtime-arm64-${{ runner.os }}-${{ hashFiles('runtime/build-runtime.sh', 'runtime/locks/**') }}
+
+      - name: Prepare build dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y zstd
+          flutter config --no-analytics --android-sdk "$ANDROID_HOME"
+          set +o pipefail
+          yes | sdkmanager --licenses >/dev/null
+          set -o pipefail
+          # The source defaults to a China mirror; cloud runners use Gradle's origin.
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('app/android/gradle/wrapper/gradle-wrapper.properties')
+          path.write_text(path.read_text().replace(
+              'https\\://mirrors.cloud.tencent.com/gradle/',
+              'https\\://services.gradle.org/distributions/'))
+          PY
+
+      - name: Build the Root runtime
+        run: ROOT_RUNTIME=1 bash runtime/build-runtime.sh arm64-v8a
+
+      - name: Resolve Flutter dependencies
+        working-directory: app
+        run: flutter pub get --enforce-lockfile
+
+      - name: Build ARM64 APK
+        env:
+          SIGNING_MODE: ${{ steps.signing.outputs.mode }}
+        run: |
+          base_version=$(python3 - <<'PY'
+          import re
+          from pathlib import Path
+          # Read major.minor.patch[-prerelease], excluding pubspec's numeric build metadata.
+          match = re.search(r'^version:\s*(\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?)(?:\+\d+)?\s*$', Path('app/pubspec.yaml').read_text(), re.M)
+          if not match:
+              raise SystemExit('No valid app version in pubspec.yaml')
+          print(match[1])
+          PY
+          )
+          if [[ $base_version == *-* ]]; then
+            build_version="$base_version.$SIGNING_MODE.$GITHUB_RUN_NUMBER"
+          else
+            build_version="$base_version-$SIGNING_MODE.$GITHUB_RUN_NUMBER"
+          fi
+          echo "BUILD_VERSION=$build_version" >> "$GITHUB_ENV"
+          bash tooling/build-root-apk.sh -f arm64 --keep-daemon --build-name "$build_version"
+
+      - name: Verify and package the APK
+        env:
+          SIGNING_MODE: ${{ steps.signing.outputs.mode }}
+          SIGNING_LABEL: ${{ steps.signing.outputs.label }}
+        run: |
+          mkdir -p dist
+          apk="dist/dsh-su-$BUILD_VERSION-$SIGNING_LABEL-arm64.apk"
+          cp app/build/app/outputs/flutter-apk/app-arm64-release.apk "$apk"
+          build_tools=$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)
+          [[ -x "$build_tools/apksigner" ]] || { echo 'apksigner is unavailable.' >&2; exit 1; }
+          if [[ $SIGNING_MODE == unsigned ]]; then
+            if "$build_tools/apksigner" verify --verbose --print-certs "$apk" > dist/SIGNATURE.txt 2>&1; then
+              echo 'Unsigned delivery unexpectedly contains a valid signature.' >&2
+              exit 1
+            fi
+          else
+            "$build_tools/apksigner" verify --verbose --min-sdk-version 21 --print-certs "$apk" > dist/SIGNATURE.txt
+            actual=$(sed -n 's/^Signer #1 certificate SHA-256 digest: //p' dist/SIGNATURE.txt)
+            [[ $actual == "$EXPECTED_SIGNER_SHA256" ]] || { echo 'APK signature does not match the configured personal key.' >&2; exit 1; }
+            grep -q '^Number of signers: 1$' dist/SIGNATURE.txt
+          fi
+          "$build_tools/aapt" dump badging "$apk" > dist/APK-INFO.txt
+          grep -q "package: name='io.github.rakanrkk.dsh_su'" dist/APK-INFO.txt
+          python3 - "$apk" <<'PY'
+          import json
+          import os
+          import re
+          import sys
+          import zipfile
+          with zipfile.ZipFile(sys.argv[1]) as apk:
+              assert apk.testzip() is None, 'APK has a damaged ZIP entry'
+              manifest = json.loads(apk.read('assets/runtime/manifest.json'))
+              assert manifest['abi'] == 'arm64-v8a', 'Wrong runtime ABI'
+              assert manifest.get('dshSuPlugin'), 'SU tools missing from the runtime'
+              assert apk.getinfo('assets/runtime/root-runtime/runc').file_size > 0, 'runc is missing'
+              if os.environ['SIGNING_MODE'] == 'unsigned':
+                  assert not any(re.fullmatch(r'META-INF/[^/]+\.(?:SF|RSA|DSA|EC)', name, re.I)
+                                 for name in apk.namelist()), 'JAR signing material is present'
+                  # APK v2/v3 signature blocks end immediately before the ZIP central directory.
+                  with open(sys.argv[1], 'rb') as stream:
+                      stream.seek(apk.start_dir - 16)
+                      assert stream.read(16) != b'APK Sig Block 42', 'APK signing block is present'
+          PY
+          (cd dist && sha256sum ./*.apk > SHA256SUMS)
+          {
+            echo "Repository: $GITHUB_REPOSITORY"
+            echo "Commit: $GITHUB_SHA"
+            echo "Version: $BUILD_VERSION"
+            echo "Signing: $SIGNING_MODE"
+            echo "Root runtime and ARM64 packaging verified; not tested on a physical phone."
+            if [[ $SIGNING_MODE == unsigned ]]; then
+              echo "UNSIGNED: cannot be installed. This artifact is for inspection or signing with the fixed fork key."
+            else
+              echo "Verified personal certificate SHA-256: $EXPECTED_SIGNER_SHA256"
+              echo "Cannot update an original DSH SU installation. Later fork updates require this same signing key and a newer versionCode."
+            fi
+          } > dist/BUILD-INFO.txt
+          cat dist/BUILD-INFO.txt >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload APK and verification files
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dsh-su-arm64-${{ steps.signing.outputs.label }}-${{ github.run_number }}
+          path: dist/
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Remove signing material
+        if: always()
+        run: |
+          rm -f app/android/key.properties
+          rm -rf "$RUNNER_TEMP/dsh-su-signing"

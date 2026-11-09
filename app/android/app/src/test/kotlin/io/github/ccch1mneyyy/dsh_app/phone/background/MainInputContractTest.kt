@@ -30,10 +30,19 @@ class MainInputContractTest {
         assertEquals(PhoneScreen.BACKGROUND, PhoneScreen.ofScreenId("b1"))
     }
 
-    @Test fun backgroundPreparationDecisionStaysPureAndConservative() {
-        assertFalse(shouldPrepareRootForBackground(mode = "off", rootRuntime = false, rootConnected = false))
-        assertFalse(shouldPrepareRootForBackground(mode = "root", rootRuntime = true, rootConnected = false))
-        assertFalse(shouldPrepareRootForBackground(mode = "off", rootRuntime = true, rootConnected = true))
-        assertTrue(shouldPrepareRootForBackground(mode = "off", rootRuntime = true, rootConnected = false))
+    @Test fun onlyFreshSuInstallsDefaultToRoot() {
+        assertEquals("root", initialBackgroundMode(null, rootRuntime = true))
+        assertEquals("off", initialBackgroundMode(null, rootRuntime = false))
+        for (rootRuntime in listOf(true, false)) {
+            assertEquals("off", initialBackgroundMode("off", rootRuntime))
+            assertEquals("adb", initialBackgroundMode("adb", rootRuntime))
+        }
+    }
+
+    @Test fun longPressIsPreservedAndSwipeCannotBecomeATap() {
+        assertEquals(MainInputCommand.TapXY(120, 240, long = true),
+            mainInputCommand(PhoneAction.TapXY("s7", 120, 240, gesture = PhoneAction.CoordinateGesture.LONG)))
+        assertNull(mainInputCommand(PhoneAction.TapXY("s7", 120, 240,
+            gesture = PhoneAction.CoordinateGesture.SWIPE, x2 = 200, y2 = 400)))
     }
 }
