@@ -201,7 +201,7 @@ class ArchiveMetadataRoundtrip(unittest.TestCase):
                 rtbuild.cmd_assemble(argparse.Namespace(
                     abi="x86_64", base=str(root / "base.tar.gz"), node=str(root / "node.tar.gz"),
                     python=str(root / "python.tar.gz"), dsh_prefix=str(dsh), pnpm_prefix=None,
-                    out=str(out), report=str(rep), runtime_info=json.dumps({"abi": "x86_64"}),
+                    out=str(out), report=str(rep), runtime_info=json.dumps({"abi": "x86_64", "ubuntuVersion": "24.04.5"}),
                     compress="gz", xz_preset="6", gzip_level=1, threads=0, epoch=1767225600,
                     prune_dev_metadata=False, deb=[str(root / "fake.deb")], bridge=None, plugin=None))
             finally:
@@ -209,6 +209,9 @@ class ArchiveMetadataRoundtrip(unittest.TestCase):
 
             with tarfile.open(out, "r:gz") as t:
                 members = {m.name: m for m in t}
+                bundled_info = json.load(t.extractfile("etc/dsh-app/runtime.json"))
+                self.assertEqual(bundled_info["upgrade"]["schema"], 1)
+                self.assertEqual(bundled_info["upgrade"]["ubuntuVersion"], "24.04.5")
 
             def expect(name, uid, gid, mode, kind="file", link=None):
                 m = members[name]

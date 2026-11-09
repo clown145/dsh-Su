@@ -13,6 +13,7 @@ import java.nio.file.Files
 import java.nio.file.StandardOpenOption
 import java.security.DigestInputStream
 import java.security.MessageDigest
+import org.json.JSONObject
 
 /**
  * Unpacks the bundled rootfs into app-private storage.
@@ -27,7 +28,8 @@ import java.security.MessageDigest
  *   runtime.reset/     the runtime being deleted
  *   runtime-keep/      what the reset keeps, mirrored under rootfs paths, until the next install
  *
- * Upgrading keeps the user's /root (DSH_HOME, workspaces) from the previous rootfs.
+ * First install creates the system; upgrades replace only app-owned engine paths.
+ * The user's Linux system, package databases and home are never rebuilt implicitly.
  */
 class RuntimeInstaller(
     private val context: Context,
@@ -44,8 +46,10 @@ class RuntimeInstaller(
     private val retiredDir = File(context.filesDir, "runtime.reset")
     private val keepDir = File(context.filesDir, "runtime-keep")
 
+    private val engineUpgrade = EngineUpgrade(baseDir, sync)
+
     fun installedVersion(): String? =
-        if (rootfs.isDirectory && versionFile.isFile) versionFile.readText().trim().ifEmpty { null } else null
+        if (!engineUpgrade.isPending() && rootfs.isDirectory && versionFile.isFile) versionFile.readText().trim().ifEmpty { null } else null
 
     fun isCurrent(): Boolean = installedVersion() == manifest.runtimeVersion
 
@@ -61,6 +65,8 @@ class RuntimeInstaller(
             val mounts = MountGuard.read(strict = rootRuntime, files = files)
             settleReset(retiredDir, keepDir, dropKept, mounts, files)
             baseDir.mkdirs()
+            // Resume the durable engine transaction before clearing a previous extraction.
+            EngineUpgrade(baseDir, sync, files = files, mounts = mounts).recover()
             // staging is a fresh tree that was never a chroot target: it deletes without host-view proof.
             staging.deleteRecursivelySafely(mounts, allowWithoutHostProof = true, files = files)
             checkFreeSpace()
@@ -116,9 +122,14 @@ class RuntimeInstaller(
             }
             onProgress(total, total)
 
+            val groupNames = appendAndroidGroupNames(staging,
+                runCatching { File("/proc/self/task/${android.os.Process.myTid()}/status").readText() }.getOrNull())
+            onLog("[dsh-app] install group names: " +
+                (groupNames.skipped?.let { "skipped ($it)" } ?: "added ${groupNames.added}"))
             timed("activate") {
-                activateRootfs(baseDir, manifest.runtimeVersion, keepDir, dropKept,
-                    sync = { timed("sync") { sync() } }, mounts = mounts, rootRuntime = rootRuntime, files = files)
+                activateRuntimeUpdate(baseDir, manifest.runtimeVersion, manifest.abi, manifest.raw,
+                    keepDir, dropKept, sync = { timed("sync") { sync() } }, onLog = onLog,
+                    mounts = mounts, rootRuntime = rootRuntime, files = files)
             }
         } finally {
             files?.close()
@@ -160,11 +171,42 @@ class RuntimeInstaller(
     }
 }
 
+/** The production activation route, also exercised without an Android Context in JVM tests. */
+internal fun activateRuntimeUpdate(
+    base: File,
+    version: String,
+    abi: String,
+    raw: JSONObject,
+    keep: File? = null,
+    dropKept: Boolean = false,
+    sync: () -> Unit,
+    onLog: (String) -> Unit = {},
+    mounts: MountGuard? = null,
+    rootRuntime: Boolean = false,
+    files: RuntimeFileAccess? = null,
+) {
+    val rootfs = File(base, "rootfs")
+    if (File(base, "home.carry").present(files) || File(base, "rootfs.old").present(files)) {
+        throw RuntimeUpgradeBlocked("legacy_interrupted")
+    }
+    if (rootfs.present(files)) {
+        val spec = checkEngineCompatibility(base, raw, version, abi, files)
+        onLog("[dsh-app] upgrading engine; preserving installed Linux system and user tools")
+        EngineUpgrade(base, sync, files = files, mounts = mounts).activate(version, spec)
+        File(base, "staging").deleteRecursivelySafely(mounts, allowWithoutHostProof = true, files = files)
+    } else {
+        // Only first install (or an explicit user-confirmed reset) may activate
+        // an entire rootfs. Never use this as an incompatible-upgrade fallback.
+        activateRootfs(base, version, keep, dropKept, sync = sync, mounts = mounts, rootRuntime = rootRuntime, files = files)
+    }
+}
+
 internal interface RuntimeFileAccess : AutoCloseable {
     fun file(file: File): File
     fun isSymlink(file: File): Boolean
     fun delete(file: File, recursive: Boolean): Boolean
     fun readText(file: File): String
+    fun openInput(file: File): java.io.InputStream = file.inputStream()
 
     /** Writes UTF-8 content, creating or truncating [file]. */
     fun writeText(file: File, content: String) {
@@ -246,6 +288,8 @@ internal fun openRootFileAccess(context: Context): RuntimeFileAccess {
 
         override fun readText(file: File): String =
             SuFileInputStream.open(this.file(file)).bufferedReader().use { it.readText() }
+
+        override fun openInput(file: File): java.io.InputStream = SuFileInputStream.open(this.file(file))
 
         override fun writeText(file: File, content: String) {
             SuFileOutputStream.open(this.file(file)).use { it.write(content.toByteArray(Charsets.UTF_8)) }
@@ -664,9 +708,12 @@ internal fun settleReset(
     mounts?.assertDeletable(retired)
     val list = File(retired, KEEP_LIST)
     val listed = readKeepList(list)
-    val rootfs = File(retired, "rootfs")
+    // activateRootfs keeps the authoritative home here until its move back succeeds.
+    // A reset during that interrupted upgrade must not keep the fresh rootfs skeleton.
+    val carry = File(retired, "home.carry")
+    val home = if (carry.present(files)) carry else File(retired, "rootfs/root")
     for (rel in listed.orEmpty()) {
-        val from = File(rootfs, rel)
+        val from = File(home, rel.removePrefix("root/"))
         val to = File(keep, rel)
         if (!from.present(files) || to.present(files)) continue
         to.parentFile?.mkdirs(files)

@@ -8,8 +8,8 @@ internal class NotificationPosts<K> {
     private val guard = Any()
     private val current = HashMap<K, Ticket<K>>()
 
-    fun begin(key: K): Ticket<K> = synchronized(guard) {
-        Ticket(key).also { current[key] = it }
+    fun begin(key: K, reuse: Ticket<K>? = null): Ticket<K> = synchronized(guard) {
+        if (reuse != null && current[key] === reuse) reuse else Ticket(key).also { current[key] = it }
     }
     fun current(ticket: Ticket<K>): Boolean = synchronized(guard) { current[ticket.key] === ticket }
     fun finish(ticket: Ticket<K>, granted: Boolean, post: () -> Boolean): ShowOutcome = synchronized(guard) {

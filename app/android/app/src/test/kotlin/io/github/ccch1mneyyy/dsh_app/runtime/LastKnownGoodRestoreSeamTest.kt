@@ -89,10 +89,14 @@ class LastKnownGoodRestoreSeamTest {
         val plan = LastKnownGood.restore(access(rootfs), rootfs, snapshot(listOf("a", "b"), "last good patch"), "S1", setPrivateMode = { true })
         assertEquals(listOf("a", "b"), plan.target)
         assertTrue(plan.bundlesChanged && plan.patchChanged)
-        assertEquals("""{"dsh":{"profile":{"bundles":["a","b"]}},"dependencies":{}}""".replace("\\/", "/"), pkgPath(rootfs).readText())
+        val restored = org.json.JSONObject(pkgPath(rootfs).readText())
+        val bundles = restored.getJSONObject("dsh").getJSONObject("profile").getJSONArray("bundles")
+        assertEquals(listOf("a", "b"), List(bundles.length()) { bundles.getString(it) })
+        assertEquals(0, restored.getJSONObject("dependencies").length())
         assertEquals("last good patch", patchPath(rootfs).readText())
+        assertEquals("current patch", File(webDir(rootfs), "cordis.patch.yml.bak-S1").readText())
         assertFalse(lockPath(rootfs).exists())
-        assertEquals(listOf("cordis.patch.yml", "package.json"), webDir(rootfs).list()!!.sorted())
+        assertEquals(listOf("cordis.patch.yml", "cordis.patch.yml.bak-S1", "package.json"), webDir(rootfs).list()!!.sorted())
     }
 
     @Test

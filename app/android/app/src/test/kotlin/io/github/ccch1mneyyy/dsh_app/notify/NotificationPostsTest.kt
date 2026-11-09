@@ -7,6 +7,24 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
 
 class NotificationPostsTest {
+    @Test fun inFlightApprovalRedeliveryKeepsResponseOwnerUntilItFinishes() {
+        val posts = NotificationPosts<String>()
+        val action = posts.begin("approval")
+        val redelivery = posts.begin("approval", action)
+        assertSame(action, redelivery)
+        assertTrue(posts.current(action))
+        // Completion retires the action as well as a redelivery still waiting
+        // for the Root permission gate; it cannot replace the result card.
+        posts.cancel("approval") {}
+        assertEquals(ShowOutcome.CANCELLED, posts.finish(redelivery, true) {
+            throw AssertionError("completed approval was posted again")
+        })
+        val next = posts.begin("approval", action)
+        assertNotSame(action, next)
+        assertTrue(posts.current(next))
+        assertFalse(posts.current(action))
+    }
+
     @Test fun cancelThenSameKeyReplacementCannotResurrectOldWaiter() {
         val posts = NotificationPosts<String>()
         val old = posts.begin("same")

@@ -3,8 +3,11 @@ package io.github.ccch1mneyyy.dsh_app.phone.a11y
 import io.github.ccch1mneyyy.dsh_app.phone.PhoneAction
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotSame
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.util.concurrent.Executors
 
 class RootMainActuatorTest {
     private class Recording(private val accepted: Boolean) : RootMainInput {
@@ -12,6 +15,7 @@ class RootMainActuatorTest {
         var calls = 0
 
         override fun send(request: RootMainInput.Request): Boolean {
+            if (request.beforeSend?.invoke() == false) return false
             calls++
             this.request = request
             return accepted
@@ -129,5 +133,88 @@ class RootMainActuatorTest {
         assertEquals(RootMainActuator.Result.Accepted, result)
         assertEquals(0, guardCalls)
         assertEquals(1, input.calls)
+    }
+
+    @Test fun expiredCoordinateAdmissionDoesNotSendRootInput() {
+        val input = Recording(accepted = true)
+        var admissions = 0
+        val result = RootMainActuator(input).tapXY(5, 6, long = true, start = {
+            admissions++
+            false
+        })
+
+        assertTrue(result is RootMainActuator.Result.Rejected)
+        assertEquals(1, admissions)
+        assertEquals(0, input.calls)
+    }
+
+    @Test fun rootFailureAfterAdmissionIsNotRetried() {
+        val input = Recording(accepted = false)
+        var admissions = 0
+        val result = RootMainActuator(input).swipe(1, 2, 3, 4, start = { send ->
+            admissions++
+            send()
+        })
+
+        assertTrue(result is RootMainActuator.Result.Rejected)
+        assertEquals(1, admissions)
+        assertEquals(1, input.calls)
+    }
+
+    @Test fun coordinateSwipePreservesDurationAndInjectionGuard() {
+        val input = Recording(accepted = true)
+        var guardedDuration = 0L
+        var inGuard = false
+        val result = RootMainActuator(input) { duration, body ->
+            guardedDuration = duration
+            inGuard = true
+            try { body() } finally { inGuard = false }
+        }.swipe(1, 2, 3, 4, durationMs = 1_400, start = { send ->
+            assertTrue(inGuard)
+            send()
+        })
+
+        assertEquals(RootMainActuator.Result.Accepted, result)
+        assertEquals(1_400L, input.request?.durationMs)
+        assertEquals(1_550L, guardedDuration)
+        assertEquals(1, input.calls)
+    }
+
+    @Test fun interruptedAdmissionPreservesCancellationWithoutSending() {
+        val input = Recording(accepted = true)
+        try {
+            val result = RootMainActuator(input).tapXY(1, 2, long = false, start = {
+                throw InterruptedException()
+            })
+            assertTrue(result is RootMainActuator.Result.Rejected)
+            assertTrue(Thread.currentThread().isInterrupted)
+            assertEquals(0, input.calls)
+        } finally {
+            Thread.interrupted()
+        }
+    }
+
+    @Test fun coordinateAdmissionVisitsMainWithoutMovingBlockingRootIoToMain() {
+        val worker = Thread.currentThread()
+        val main = Executors.newSingleThreadExecutor()
+        var admissionThread: Thread? = null
+        val input = RootMainInput { request ->
+            assertSame("Root transport stays on the calling worker", worker, Thread.currentThread())
+            checkNotNull(request.beforeSend).invoke()
+        }
+        try {
+            val result = RootMainActuator(input).tapXY(1, 2, long = false, start = { claim ->
+                val ticket = CoordinateDispatch(worker, { true }, { admit ->
+                    admissionThread = Thread.currentThread()
+                    admit()
+                }, claim)
+                main.execute(ticket)
+                ticket.awaitStart(2_000)
+            })
+            assertEquals(RootMainActuator.Result.Accepted, result)
+            assertNotSame(worker, admissionThread)
+        } finally {
+            main.shutdownNow()
+        }
     }
 }
